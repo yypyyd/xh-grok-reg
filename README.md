@@ -327,6 +327,10 @@ Outlook/Gmail OAuth 邮箱还需要对应的 client_id 和 refresh_token。refre
 
 </details>
 
-## 📄 许可证与贡献
+## 🔗 友情链接
 
-当前仓库未额外指定开源许可证。公开发布前请根据你的分发需求补充许可证、第三方依赖声明和安全披露渠道。
+[Linux.do 社区](https://linux.do/)
+
+## 📄 License
+
+[MIT](https://github.com/kaibush/grok-register/blob/main/LICENSE)
