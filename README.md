@@ -333,4 +333,4 @@ Outlook/Gmail OAuth 邮箱还需要对应的 client_id 和 refresh_token。refre
 
 ## 📄 License
 
-[MIT](https://github.com/kaibush/grok-register/blob/main/LICENSE)
+[MIT](./LICENSE)
