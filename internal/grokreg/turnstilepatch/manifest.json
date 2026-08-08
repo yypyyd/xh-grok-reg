@@ -1,0 +1,14 @@
+{
+    "name": "Turnstile Patch",
+    "version": "0.0.1",
+    "manifest_version": 3,
+    "content_scripts": [
+        {
+            "js": ["script.js"],
+            "matches": ["<all_urls>"],
+            "run_at": "document_start",
+            "all_frames": true,
+            "world": "MAIN"
+        }
+    ]
+}

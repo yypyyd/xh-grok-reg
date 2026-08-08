@@ -1,0 +1,11 @@
+.proxy-test-panel{max-width:none;width:100%}
+.proxy-test-panel .panel-head{align-items:flex-start}
+.proxy-test-panel .muted{max-width:560px;margin:7px 0 0;font-size:12px}
+.proxy-symbol{width:34px;height:34px;border-radius:10px;background:#edf3ff;color:#2868e8;display:grid;place-items:center;font-size:18px;font-weight:700}
+.proxy-test-row{display:flex;gap:10px;margin-top:22px}
+.proxy-test-row input{flex:1;min-width:0}
+.proxy-result{margin-top:13px;border-radius:8px;padding:10px 12px;font-size:12px;display:flex;align-items:center;gap:8px}
+.proxy-result i{width:7px;height:7px;border-radius:50%;display:block}
+.proxy-result.ok{background:#eaf8f1;color:#1f9c64}.proxy-result.ok i{background:#2eb77b}
+.proxy-result.bad{background:#fff0f1;color:#c64d5b}.proxy-result.bad i{background:#d65b67}
+@media(max-width:640px){.proxy-test-row{flex-direction:column}.proxy-test-row button{width:100%}}
