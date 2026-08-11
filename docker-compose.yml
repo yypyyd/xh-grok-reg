@@ -1,0 +1,36 @@
+# xh-grok-reg 一键部署（完整版：支持 Grok 自动注册）
+# 使用：docker compose up -d
+# 访问：http://localhost:9000/  （默认账号 admin / admin123，首次登录请改密）
+services:
+  xh-grok-reg:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # 国内网络给 CloakBrowser 下载加速源（可选，任选可达的加速域名）：
+        #   CLOAKBROWSER_DOWNLOAD_URL=https://gh.ddlc.top/https://github.com/CloakHQ/cloakbrowser/releases/download
+        # 也可在 .env 里设置 CLOAKBROWSER_DOWNLOAD_URL / BUILD_HTTPS_PROXY
+        CLOAKBROWSER_DOWNLOAD_URL: ${CLOAKBROWSER_DOWNLOAD_URL:-}
+        BUILD_HTTPS_PROXY: ${BUILD_HTTPS_PROXY:-}
+    image: xh-grok-reg:latest
+    container_name: xh-grok-reg
+    restart: unless-stopped
+    ports:
+      - "9000:9000"
+    environment:
+      ADDR: ":9000"
+      # 有 Xvfb 虚拟显示，用 offscreen（headed 移出屏幕）对 Turnstile 更友好
+      TURNSTILE_MODE: "offscreen"
+    volumes:
+      # grok-register.db + clearance（邮箱凭据、代理、截图、任务数据）
+      - grok-data:/data
+      # rod 浏览器缓存（browser / browser-grok），避免容器重建后重复下载 Chromium
+      - grok-cache:/root/.cache
+    # Chromium 多页面 /dev/shm 太小会崩，必须给足
+    shm_size: "2gb"
+    # 如需与宿主机同网段出口（代理、邮箱、x.ai），改用 host 网络（取消注释）：
+    # network_mode: host
+
+volumes:
+  grok-data:
+  grok-cache:
