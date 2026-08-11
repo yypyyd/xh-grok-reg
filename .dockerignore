@@ -1,0 +1,21 @@
+# Git
+.git
+.gitignore
+
+# 前端构建产物/依赖（Stage1 会重新构建，static 由 go:embed 从 Stage1 拷入）
+node_modules
+frontend/node_modules
+frontend/dist
+static
+
+# 数据与敏感文件（绝不进镜像）
+*.db
+*.db-shm
+*.db-wal
+*.log
+*.exe
+.env
+
+# 部署编排文件
+docker-compose.yml
+DEPLOY-DOCKER.md
