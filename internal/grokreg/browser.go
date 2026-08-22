@@ -3,6 +3,7 @@ package grokreg
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -18,6 +19,10 @@ import (
 	launcherflags "github.com/go-rod/rod/lib/launcher/flags"
 	"github.com/go-rod/rod/lib/proto"
 )
+
+// ErrEmailTaken is a permanent registration outcome. The producer uses it to
+// keep an existing account out of the transient-failure retry queue.
+var ErrEmailTaken = errors.New("该邮箱已注册 Grok")
 
 func registerBrowser(ctx context.Context, in Input) (res *Result, err error) {
 	if in.Headless {
@@ -254,7 +259,7 @@ func registerBrowser(ctx context.Context, in Input) (res *Result, err error) {
 		return nil, err
 	}
 
-	// 附加后处理：提取 sso token（Console / Sub2API 导出用）。
+	// 附加后处理：提取 sso token（Console / Grok2API 导出用）。
 	if sso := ssoFromCookies(auth); sso != "" {
 		auth["sso"] = sso
 	}
@@ -263,7 +268,7 @@ func registerBrowser(ctx context.Context, in Input) (res *Result, err error) {
 	return &Result{AuthJSON: auth}, nil
 }
 
-// ssoFromCookies 取出 Grok 的 sso cookie 值，供 Console / Sub2API 导出使用。
+// ssoFromCookies 取出 Grok 的 sso cookie 值，供 Console / Grok2API 导出使用。
 func ssoFromCookies(auth map[string]any) string {
 	list, _ := auth["cookies"].([]map[string]any)
 	for _, c := range list {
@@ -503,11 +508,18 @@ func waitForSelectorOrCF(ctx context.Context, page *rod.Page, in Input, trace *p
 		}
 		// surface page errors early (rate limit, invalid email, etc.)
 		if msg := pageBlockReason(pg); msg != "" {
-			return fmt.Errorf("%s", msg)
+			return blockReasonErr(msg)
 		}
 		time.Sleep(800 * time.Millisecond)
 	}
 	return fmt.Errorf("等待元素超时: %s diag=%s", selector, captchaDiag(page.Timeout(5*time.Second)))
+}
+
+func blockReasonErr(msg string) error {
+	if msg == ErrEmailTaken.Error() {
+		return ErrEmailTaken
+	}
+	return fmt.Errorf("%s", msg)
 }
 
 // pageBlockReason returns a short Chinese error when the signup page is blocked.
@@ -856,7 +868,7 @@ func waitGrokReady(ctx context.Context, page *rod.Page, in Input) error {
 		}
 
 		if msg := pageBlockReason(pg); msg != "" {
-			return fmt.Errorf("%s", msg)
+			return blockReasonErr(msg)
 		}
 		if hasText(pg, "button", "Continue|继续|完成|确认") {
 			pg.MustElementR("button", "Continue|继续|完成|确认").MustEval(`() => this.click()`)

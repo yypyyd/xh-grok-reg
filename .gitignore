@@ -31,3 +31,4 @@ browser-*/
 .ace-tool/
 .claude/
 .playwright-mcp/
+.playwright-cli/

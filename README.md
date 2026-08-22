@@ -18,9 +18,9 @@
 |:---:|:---:|:---:|
 | 支持单个注册、批量生产、停止任务和验证码提交 | Outlook/Gmail/IMAP 邮箱认证、批量导入和验证码轮询 | 总览、账号、邮箱、代理和系统设置集中管理 |
 
-| 🛡️ Turnstile 支持 | 🔁 测活与额度 | 📦 两种格式导出 |
+| 🛡️ Turnstile 支持 | 🔁 测活与额度 | 📦 四种格式导出 |
 |:---:|:---:|:---:|
-| Linux CloakBrowser helper 签发注册所需令牌 | Console 测活、OAuth refresh 回退和额度写回 | Console 与 Sub2API 凭据导出 |
+| Linux CloakBrowser helper 签发注册所需令牌 | Console 测活、OAuth refresh 回退和额度写回 | Console、Grok2API、Sub2API 与 CPA 凭据导出 |
 
 > 项目只提供 Grok 注册和公共管理能力，并使用独立设计的 React/Vite 管理台。
 
@@ -47,9 +47,9 @@ Grok 协议客户端抓取注册配置并提交注册请求
         ↓
 邮箱池轮询验证码（或人工提交验证码）
         ↓
-注册成功 → 保存会话 → 状态更新为「已注册」
+注册成功 → 保存会话并预铸 xAI Build OAuth → 状态更新为「已注册」
         ↓
-按需测活、探测额度、导出 Console/Sub2API
+按需测活、探测额度、导出 Console/Grok2API/Sub2API/CPA
 ~~~
 
 ### 关键技术点
@@ -61,7 +61,9 @@ Grok 协议客户端抓取注册配置并提交注册请求
 | **代理一致性** | Turnstile 签发、注册请求和账号网络会话使用同一代理出口 |
 | **Chromium 管理** | Go 服务启动时检查 rod Chromium，缺失时显示下载进度并自动准备 |
 | **失败存证** | 注册日志和失败截图落库，可从管理台实时查看 |
-| **并发安全** | 每个注册任务独立上下文，生产器负责并发闸门、停止和孤儿任务回收 |
+| **目标补单** | 批量任务只按并发上限取首批邮箱，失败后自动补号；临时失败遵循冷却时间，已注册邮箱进入终态 |
+| **并发安全** | 每个注册任务独立上下文，生产器负责并发闸门、补单循环、停止和孤儿任务回收 |
+| **OAuth 导出** | 新号注册后预铸 xAI Build OAuth；旧号导出 Sub2API/CPA 时按需补铸并缓存 |
 | **自动刷新** | Grok 列表和生产进度在页面可见时自动轮询，注册成功后状态自动更新 |
 
 ## 🏗️ 项目架构
@@ -74,12 +76,14 @@ xh-grok-reg/
 │   ├── auth/                  # JWT 管理员鉴权和改密
 │   ├── browserboot/           # rod Chromium 检查、下载和状态
 │   ├── db/                    # SQLite 初始化、迁移和任务恢复
+│   ├── grokoauth/             # Grok SSO 到 xAI Build OAuth 的设备码转换与导出结构
 │   ├── grokreg/               # Grok 浏览器/协议注册、Turnstile、代理桥
-│   ├── grokproducer/          # 单个/批量生产、并发、停止、日志和截图
+│   ├── grokproducer/          # 单个/批量生产、冷却补单、并发、停止、日志和截图
 │   ├── livecheck/             # Grok 测活、OAuth refresh 和额度探测
 │   ├── mailfetch/             # 邮箱验证码取件
 │   ├── mailverify/            # 邮箱后台认证队列
 │   ├── models/                # Grok、Mailbox、Setting、Admin 数据模型
+│   ├── proxyutil/             # 代理规范化、HTTP transport 与 BestGo 任务 session
 │   └── handlers/              # 登录、Grok、邮箱、设置、代理 API
 ├── frontend/                  # React + Vite 前端源码
 ├── static/                    # Vite 构建产物（由 Go embed）
@@ -232,8 +236,8 @@ journalctl -u xh-grok-reg -f
 | 变量 | 作用 | 默认值 |
 | --- | --- | --- |
 | ADDR | HTTP 监听地址 | :9000 |
-| GROK_TURNSTILE_PYTHON | Turnstile helper 的 Python | /opt/cloakbrowser-venv/bin/python |
-| GROK_TURNSTILE_SCRIPT | Turnstile 单次签发脚本 | /usr/local/share/grok-reg/turnstile_mint.py |
+| GROK_TURNSTILE_PYTHON | Turnstile helper 的 Python | 优先 `/opt/cloakbrowser-venv/bin/python`，缺失时查找 `python3` |
+| GROK_TURNSTILE_SCRIPT | Turnstile 单次签发脚本 | 自动查找二进制同级、仓库和共享目录下的 `turnstile_mint.py` |
 | TURNSTILE_MODE | helper 浏览器模式 | offscreen |
 
 scripts/turnstile_pool.py 是可选外部脚本，Go 服务不会自动调用它。
@@ -245,7 +249,21 @@ scripts/turnstile_pool.py 是可选外部脚本，Go 服务不会自动调用它
 - 分页、搜索、状态筛选和批量勾选
 - 单个注册、批量生产、停止任务和手动提交验证码
 - 实时日志、失败截图、测活、Console 额度展示
-- 单个/批量导出 Console 与 Sub2API
+- 单个/批量导出 Console、Grok2API SSO 池、Sub2API OAuth 账号包与 CPA xAI 凭据
+- 批量生产按并发数领取首批邮箱，失败后自动补单直至达到目标；支持失败重试冷却和邮箱使用间隔
+- 邮箱已存在于 Grok 时标记为「邮箱已注册」，不进入临时失败重试队列
+
+#### 批量取号规则
+
+当前项目只从 `mailboxes` 邮箱池领取 `status=verified` 的精确邮箱地址，按邮箱 ID 从小到大处理，不读取 ChatGPT 账号表，也不会自动生成 `user+001@example.com` 一类裂变地址。首批领取数量为「目标成功数」与 `max_concurrency` 的较小值；后台每 5 秒检查空闲槽位，失败后继续补号，直到本批次成功数达到目标或彻底没有候选邮箱。
+
+- 从未创建过 Grok 记录的已验证邮箱可以直接领取。
+- `register_failed` 只有超过 `retry_cooldown_min`，并满足 `mailbox_interval_min` 后才能重试。
+- `registered`、`registering`、`waiting_code` 和 `already_registered` 不再参与自动领取。
+- 只有冷却中或尚未达到使用间隔的候选时，批次每分钟重新检查；没有运行任务也没有可等待候选时提前结束。
+- 页面填写的注册数量是目标成功数，不是最大尝试次数；单个手动注册不计入当前批次进度。
+
+与上游 `chatgpt-register` 不同，该项目没有 `models.Registration` ChatGPT 账号池，因此不会优先消费已注册的 ChatGPT 邮箱或同一母邮箱下的裂变地址。设置项 `fission_count` 目前只用于邮箱页面展示「注册用量 / 注册上限」，不参与 Grok 批量取号；在当前自动流程中，一个已验证邮箱通常最多对应一个成功的 Grok 账号，失败后可以冷却重试同一地址。
 
 ### 邮箱池
 
@@ -256,7 +274,7 @@ scripts/turnstile_pool.py 是可选外部脚本，Go 服务不会自动调用它
 
 ### 系统设置
 
-- 并发数、全局代理开关和代理列表
+- 并发数、失败重试冷却、邮箱使用间隔、全局代理开关和代理列表
 - 代理连通性测试
 - Chromium 无头模式和 Grok 注册引擎参数
 
@@ -297,7 +315,7 @@ Outlook/Gmail OAuth 邮箱还需要对应的 client_id 和 refresh_token。refre
 
 **Q：报 turnstile_mint.py: no such file？**
 
-**A：**helper 没有复制到共享目录，检查 GROK_TURNSTILE_SCRIPT 和文件权限。
+**A：**服务会依次检查可执行文件同级 `scripts/`、安装前缀共享目录、当前工作目录 `scripts/` 和系统共享目录。仍未找到时，检查部署是否包含仓库的 `scripts/turnstile_mint.py`，或显式设置 GROK_TURNSTILE_SCRIPT 并确认文件权限。
 
 **Q：报 OAuth scope unsupported by refresh token？**
 

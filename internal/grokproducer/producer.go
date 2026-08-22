@@ -3,6 +3,7 @@ package grokproducer
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -10,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"xh-grok-reg/internal/grokoauth"
 	"xh-grok-reg/internal/grokreg"
 	"xh-grok-reg/internal/mailfetch"
 	"xh-grok-reg/internal/models"
@@ -26,8 +28,10 @@ const (
 
 	// defaultMaxConcurrency 未配置任何并发键时的默认值：逐个开工。批量注册时多个
 	// 有头浏览器 + Turnstile 令牌池同时抢 CPU 会互相超时，串行最稳。可用设置页
-	// 「最大并发数」(max_concurrency) 或专用键 grok_max_concurrency 调大。
-	defaultMaxConcurrency = 1
+	// 「最大并发数」(max_concurrency) 调大。
+	defaultMaxConcurrency     = 1
+	defaultRetryCooldownMin   = 30
+	defaultMailboxIntervalMin = 5
 )
 
 var (
@@ -44,7 +48,12 @@ type Producer struct {
 	cancel  map[uint]context.CancelFunc
 	active  int // 当前真正在跑（已获得并发槽位）的任务数
 	pxIdx   int
-	target  int
+
+	topUpCancel context.CancelFunc
+	topUpID     uint64
+	nextTopUpID uint64
+	runTarget   int
+	runTracked  []uint
 }
 
 func New(db *gorm.DB, mail *mailfetch.Client) *Producer {
@@ -97,55 +106,311 @@ func (p *Producer) Start(email, note string) (*models.GrokRegistration, error) {
 	return &reg, nil
 }
 
+// StartFromAccounts starts only enough work to fill the concurrency slots.
+// The background top-up loop retries cooled-down failures and claims another
+// mailbox after every failure until this run reaches its requested target.
 func (p *Producer) StartFromAccounts(count int) ([]models.GrokRegistration, error) {
 	if count < 1 {
 		return nil, fmt.Errorf("数量必须 >= 1")
 	}
-	p.mu.Lock()
-	p.target = count
-	p.mu.Unlock()
+	ctx, topUpID, ok := p.beginTopUp()
+	if !ok {
+		return nil, fmt.Errorf("已有 Grok 批量注册任务正在运行")
+	}
+	started, cooling, err := p.claimTargets(minInt(count, p.maxConcurrency()))
+	if err != nil {
+		p.endTopUp(topUpID)
+		return nil, err
+	}
+	if len(started) == 0 {
+		p.endTopUp(topUpID)
+		if cooling {
+			return nil, fmt.Errorf("可重试的邮箱仍在冷却或使用间隔内，请稍后再试")
+		}
+		return nil, fmt.Errorf("邮箱管理里没有可用于 Grok 注册的账号")
+	}
+	if !p.beginRun(topUpID, count, started) {
+		p.abandonClaims(started)
+		return nil, fmt.Errorf("Grok 批量注册任务已取消")
+	}
+	for _, reg := range started {
+		go p.runWithParent(ctx, reg.ID)
+	}
+	go p.topUp(ctx, topUpID)
+	return started, nil
+}
+
+func (p *Producer) claimTargets(count int) ([]models.GrokRegistration, bool, error) {
+	cutoff := time.Now().Add(-p.retryCooldown())
+	blocked := p.db.Model(&models.GrokRegistration{}).
+		Select("email").
+		Where("status <> ? OR updated_at > ?", "register_failed", cutoff)
+	busyCutoff := time.Now().Add(-p.mailboxInterval())
+	busyMailboxes := p.db.Model(&models.GrokRegistration{}).
+		Select("mailbox_id").
+		Where("mailbox_id <> 0").
+		Where("status IN ? OR updated_at > ?", []string{"registering", "waiting_code"}, busyCutoff)
+
 	var mailboxes []models.Mailbox
 	if err := p.db.
 		Where("status = ?", "verified").
-		Where("email NOT IN (?)",
-			p.db.Model(&models.GrokRegistration{}).Select("email")).
+		Where("email NOT IN (?)", blocked).
+		Where("id NOT IN (?)", busyMailboxes).
 		Order("id asc").
-		Limit(count).
+		Limit(count * 20).
 		Find(&mailboxes).Error; err != nil {
+		return nil, false, err
+	}
+	started := make([]models.GrokRegistration, 0, count)
+	for _, mb := range mailboxes {
+		if len(started) >= count {
+			break
+		}
+		reg, err := p.claimOne(mb.Email, mb.ID,
+			fmt.Sprintf("来源: 邮箱管理 #%d，自动读取验证码", mb.ID))
+		if err != nil {
+			return started, false, err
+		}
+		started = append(started, *reg)
+	}
+	if len(started) > 0 {
+		return started, false, nil
+	}
+	return started, p.hasCoolingFailure(cutoff) || p.hasBusyMailbox(busyCutoff), nil
+}
+
+func (p *Producer) claimOne(email string, mailboxID uint, note string) (*models.GrokRegistration, error) {
+	reg := models.GrokRegistration{
+		Email: email, MailboxID: mailboxID, Password: grokreg.GenPassword(16),
+		Status: "registering", Note: note,
+	}
+	var existing models.GrokRegistration
+	if err := p.db.Where("email = ?", email).First(&existing).Error; err == nil {
+		existing.MailboxID = mailboxID
+		existing.Status = "registering"
+		existing.Shipped = false
+		existing.Password = reg.Password
+		existing.Note = note
+		existing.AuthData = ""
+		existing.Shot = nil
+		if err := p.db.Save(&existing).Error; err != nil {
+			return nil, err
+		}
+		return &existing, nil
+	}
+	if err := p.db.Create(&reg).Error; err != nil {
 		return nil, err
 	}
-	started := make([]models.GrokRegistration, 0, len(mailboxes))
-	for _, mb := range mailboxes {
-		reg := models.GrokRegistration{
-			Email:     mb.Email,
-			MailboxID: mb.ID,
-			Password:  grokreg.GenPassword(16),
-			Status:    "registering",
-			Note:      fmt.Sprintf("来源: 邮箱管理 #%d，自动读取验证码", mb.ID),
+	return &reg, nil
+}
+
+func (p *Producer) hasCoolingFailure(cutoff time.Time) bool {
+	var n int64
+	p.db.Model(&models.GrokRegistration{}).
+		Joins("JOIN mailboxes ON mailboxes.id = grok_registrations.mailbox_id AND mailboxes.status = ?", "verified").
+		Where("grok_registrations.status = ? AND grok_registrations.updated_at > ?", "register_failed", cutoff).Count(&n)
+	return n > 0
+}
+
+func (p *Producer) hasBusyMailbox(cutoff time.Time) bool {
+	var n int64
+	p.db.Model(&models.GrokRegistration{}).
+		Joins("JOIN mailboxes ON mailboxes.id = grok_registrations.mailbox_id AND mailboxes.status = ?", "verified").
+		Where("grok_registrations.mailbox_id <> 0 AND grok_registrations.updated_at > ?", cutoff).Count(&n)
+	return n > 0
+}
+
+func (p *Producer) mailboxInterval() time.Duration {
+	return time.Duration(p.settingInt("mailbox_interval_min", defaultMailboxIntervalMin)) * time.Minute
+}
+
+func (p *Producer) retryCooldown() time.Duration {
+	return time.Duration(p.settingInt("retry_cooldown_min", defaultRetryCooldownMin)) * time.Minute
+}
+
+func (p *Producer) settingInt(key string, def int) int {
+	raw := strings.TrimSpace(p.getSetting(key))
+	if raw == "" {
+		return def
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 0 {
+		return def
+	}
+	return n
+}
+
+func (p *Producer) topUp(ctx context.Context, topUpID uint64) {
+	defer p.endTopUp(topUpID)
+	for {
+		if !sleepCtx(ctx, 5*time.Second) {
+			return
 		}
-		var existing models.GrokRegistration
-		if err := p.db.Where("email = ?", mb.Email).First(&existing).Error; err == nil {
-			existing.MailboxID = mb.ID
-			existing.Status = "registering"
-			existing.Shipped = false
-			existing.Password = reg.Password
-			existing.Note = reg.Note
-			existing.AuthData = ""
-			existing.Shot = nil
-			if err := p.db.Save(&existing).Error; err != nil {
-				return started, err
+		running := p.batchRunningNum()
+		remaining := p.targetRemaining(running)
+		if remaining <= 0 {
+			if running > 0 {
+				continue
 			}
-			reg = existing
-		} else if err := p.db.Create(&reg).Error; err != nil {
-			return started, err
+			return
 		}
-		started = append(started, reg)
-		go p.run(reg.ID)
+		slots := p.maxConcurrency() - running
+		if slots <= 0 {
+			continue
+		}
+		regs, cooling, err := p.claimTargets(minInt(remaining, slots))
+		if err != nil {
+			return
+		}
+		if len(regs) == 0 {
+			if running > 0 {
+				continue
+			}
+			if cooling && sleepCtx(ctx, time.Minute) {
+				continue
+			}
+			return
+		}
+		if !p.trackRun(topUpID, regs) {
+			p.abandonClaims(regs)
+			return
+		}
+		for _, reg := range regs {
+			go p.runWithParent(ctx, reg.ID)
+		}
 	}
-	if len(started) == 0 {
-		return nil, fmt.Errorf("账号管理和邮箱管理里都没有可用于 Grok 注册的账号")
+}
+
+func (p *Producer) beginRun(topUpID uint64, count int, started []models.GrokRegistration) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.topUpCancel == nil || p.topUpID != topUpID {
+		return false
 	}
-	return started, nil
+	p.runTarget = count
+	p.runTracked = make([]uint, 0, count)
+	for _, reg := range started {
+		p.runTracked = append(p.runTracked, reg.ID)
+	}
+	return true
+}
+
+func (p *Producer) trackRun(topUpID uint64, regs []models.GrokRegistration) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.topUpCancel == nil || p.topUpID != topUpID {
+		return false
+	}
+	for _, reg := range regs {
+		p.runTracked = append(p.runTracked, reg.ID)
+	}
+	return true
+}
+
+func (p *Producer) abandonClaims(regs []models.GrokRegistration) {
+	ids := make([]uint, 0, len(regs))
+	for _, reg := range regs {
+		ids = append(ids, reg.ID)
+	}
+	if len(ids) == 0 {
+		return
+	}
+	p.db.Model(&models.GrokRegistration{}).
+		Where("id IN ? AND status = ?", ids, "registering").
+		Updates(map[string]any{"status": "register_failed", "note": "已取消"})
+}
+
+func (p *Producer) beginTopUp() (context.Context, uint64, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.topUpCancel != nil {
+		return nil, 0, false
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	p.nextTopUpID++
+	p.topUpID = p.nextTopUpID
+	p.topUpCancel = cancel
+	return ctx, p.topUpID, true
+}
+
+// endTopUp only clears the batch that owns topUpID. A canceled batch may
+// finish after another batch has started, so stale cleanup must be ignored.
+func (p *Producer) endTopUp(topUpID uint64) {
+	p.mu.Lock()
+	if p.topUpCancel != nil && p.topUpID == topUpID {
+		cancel := p.topUpCancel
+		p.topUpCancel = nil
+		p.topUpID = 0
+		p.mu.Unlock()
+		cancel()
+		return
+	}
+	p.mu.Unlock()
+}
+
+func (p *Producer) stopTopUp() {
+	p.mu.Lock()
+	cancel := p.topUpCancel
+	p.topUpCancel = nil
+	p.topUpID = 0
+	p.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func (p *Producer) batchRunningNum() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	n := 0
+	for _, id := range p.runTracked {
+		if p.cancel[id] != nil {
+			n++
+		}
+	}
+	return n
+}
+
+func (p *Producer) countRegistered(ids []uint) int {
+	return p.countTrackedStatus(ids, "registered")
+}
+
+func (p *Producer) countTrackedStatus(ids []uint, status string) int {
+	if len(ids) == 0 {
+		return 0
+	}
+	var n int64
+	p.db.Model(&models.GrokRegistration{}).
+		Where("id IN ? AND status = ?", ids, status).Count(&n)
+	return int(n)
+}
+
+func (p *Producer) targetRemaining(running int) int {
+	p.mu.Lock()
+	target := p.runTarget
+	tracked := append([]uint(nil), p.runTracked...)
+	p.mu.Unlock()
+	remaining := target - p.countRegistered(tracked) - running
+	if remaining < 0 {
+		return 0
+	}
+	return remaining
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(d):
+		return true
+	}
 }
 
 func (p *Producer) SubmitCode(id uint, code string) error {
@@ -177,8 +442,9 @@ func (p *Producer) Stop(id uint) {
 	}
 }
 
-// StopAll 请求停止所有在跑的 Grok 注册任务。
+// StopAll stops active registrations and the batch top-up loop.
 func (p *Producer) StopAll() {
+	p.stopTopUp()
 	p.mu.Lock()
 	cancels := make([]context.CancelFunc, 0, len(p.cancel))
 	for _, cancel := range p.cancel {
@@ -204,28 +470,28 @@ type Progress struct {
 // Snapshot 返回 Grok 生产进度：在跑数取自当前运行的任务，其余按库中状态统计。
 func (p *Producer) Snapshot() Progress {
 	p.mu.Lock()
-	runningNum := len(p.cancel)
-	target := p.target
+	target := p.runTarget
+	topUp := p.topUpCancel != nil
+	tracked := append([]uint(nil), p.runTracked...)
 	p.mu.Unlock()
-
-	count := func(statuses ...string) int {
-		var n int64
-		p.db.Model(&models.GrokRegistration{}).Where("status IN ?", statuses).Count(&n)
-		return int(n)
-	}
+	runningNum := p.batchRunningNum()
 	return Progress{
-		Running:    runningNum > 0,
+		Running:    runningNum > 0 || topUp,
 		Target:     target,
-		Pending:    count("pending"),
+		Pending:    p.targetRemaining(runningNum),
 		RunningNum: runningNum,
-		Registered: count("registered"),
-		Failed:     count("register_failed"),
-		Message:    map[bool]string{true: "批量注册进行中", false: "等待新的批量任务"}[runningNum > 0],
+		Registered: p.countTrackedStatus(tracked, "registered"),
+		Failed:     p.countTrackedStatus(tracked, "register_failed"),
+		Message:    map[bool]string{true: "批量注册进行中", false: "等待新的批量任务"}[runningNum > 0 || topUp],
 	}
 }
 
 func (p *Producer) run(id uint) {
-	ctx, cancel := context.WithCancel(context.Background())
+	p.runWithParent(context.Background(), id)
+}
+
+func (p *Producer) runWithParent(parent context.Context, id uint) {
+	ctx, cancel := context.WithCancel(parent)
 	p.mu.Lock()
 	p.cancel[id] = cancel
 	p.mu.Unlock()
@@ -288,19 +554,45 @@ func (p *Producer) run(id uint) {
 	res, err := grokreg.Register(ctx, in)
 	if err != nil {
 		p.appendLog(id, "注册失败: "+err.Error())
+		status := "register_failed"
+		if errors.Is(err, grokreg.ErrEmailTaken) {
+			status = "already_registered"
+		}
 		p.db.Model(&models.GrokRegistration{}).Where("id = ?", id).Updates(map[string]any{
-			"status": "register_failed",
+			"status": status,
 			"note":   truncateStr(err.Error(), 500),
 		})
 		return
 	}
 
+	p.mintOAuth(ctx, id, in.Proxy, reg.Email, res.AuthJSON)
 	authBytes, _ := json.MarshalIndent(res.AuthJSON, "", "  ")
 	p.appendLog(id, "Grok 注册成功")
 	p.db.Model(&models.GrokRegistration{}).Where("id = ?", id).Updates(map[string]any{
 		"status":    "registered",
 		"auth_data": string(authBytes),
 	})
+}
+
+// mintOAuth stores xAI Build credentials while the registration's proxy and
+// session are still warm. Export retries conversion for old records or a
+// transient failure, so OAuth minting never changes registration success.
+func (p *Producer) mintOAuth(ctx context.Context, id uint, proxy, email string, auth map[string]any) {
+	if auth == nil {
+		return
+	}
+	sso := grokoauth.SSOFromAuth(auth)
+	if sso == "" {
+		return
+	}
+	p.appendLog(id, "正在换取 Grok OAuth 令牌（Sub2API / CPA 导出用）")
+	info, err := grokoauth.ConvertSSO(ctx, proxy, sso)
+	if err != nil {
+		p.appendLog(id, "换取 OAuth 令牌失败，导出时会重试: "+err.Error())
+		return
+	}
+	auth["oauth"] = grokoauth.Credentials(info, email)
+	p.appendLog(id, "已换取 Grok OAuth 令牌")
 }
 
 func (p *Producer) waitManualCode(ctx context.Context, id uint) (string, error) {
@@ -404,13 +696,9 @@ func (p *Producer) appendLog(id uint, line string) {
 	p.db.Model(&models.GrokRegistration{}).Where("id = ?", id).Update("log", log)
 }
 
-// maxConcurrency 读取并发上限：优先用 Grok 专用键 grok_max_concurrency，
-// 未设置时继承设置页「最大并发数」(max_concurrency)，都没有则默认 1，最小为 1。
+// maxConcurrency follows the global registration concurrency setting.
 func (p *Producer) maxConcurrency() int {
-	raw := strings.TrimSpace(p.getSetting("grok_max_concurrency"))
-	if raw == "" {
-		raw = strings.TrimSpace(p.getSetting("max_concurrency"))
-	}
+	raw := strings.TrimSpace(p.getSetting("max_concurrency"))
 	n := defaultMaxConcurrency
 	if raw != "" {
 		if parsed, err := strconv.Atoi(raw); err == nil {

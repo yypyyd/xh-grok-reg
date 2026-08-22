@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -18,18 +19,61 @@ import (
 // the GROK_TURNSTILE_* environment variables.
 const (
 	defaultTurnstilePython   = "/opt/cloakbrowser-venv/bin/python"
-	defaultTurnstileScript   = "/usr/local/share/grok-reg/turnstile_mint.py"
 	defaultTurnstileMode     = "offscreen"
 	fallbackTurnstileSitekey = "0x4AAAAAAAhr9JGVDZbrZOo0"
 	turnstileSignURL         = "https://accounts.x.ai/sign-up"
 )
 
+// turnstileScriptDirs covers repository development, a side-by-side binary
+// deployment, prefix/share installs, and the legacy path documented by this
+// project before scripts were bundled into the repository.
+func turnstileScriptDirs() []string {
+	var dirs []string
+	if exe, err := os.Executable(); err == nil {
+		exeDir := filepath.Dir(exe)
+		dirs = append(dirs,
+			filepath.Join(exeDir, "scripts"),
+			filepath.Join(exeDir, "..", "share", "xh-grok-reg", "scripts"),
+		)
+	}
+	if wd, err := os.Getwd(); err == nil {
+		dirs = append(dirs, filepath.Join(wd, "scripts"))
+	}
+	return append(dirs,
+		"/usr/local/share/xh-grok-reg/scripts",
+		"/usr/local/share/grok-reg",
+	)
+}
+
+func turnstileScriptPath(name string) string {
+	for _, dir := range turnstileScriptDirs() {
+		path := filepath.Join(dir, name)
+		if stat, err := os.Stat(path); err == nil && !stat.IsDir() {
+			return path
+		}
+	}
+	return ""
+}
+
+func turnstilePython() string {
+	if stat, err := os.Stat(defaultTurnstilePython); err == nil && !stat.IsDir() {
+		return defaultTurnstilePython
+	}
+	if path, err := exec.LookPath("python3"); err == nil {
+		return path
+	}
+	return defaultTurnstilePython
+}
+
 // mintTurnstileToken shells out to the CloakBrowser mint helper and returns the
 // signed Turnstile token. It routes through the registration's loopback proxy so
 // the token's remote IP matches the account being created.
 func mintTurnstileToken(ctx context.Context, in Input, sitekey, pageURL string) (string, error) {
-	python := firstNonEmpty(in.TurnstilePython, os.Getenv("GROK_TURNSTILE_PYTHON"), defaultTurnstilePython)
-	script := firstNonEmpty(in.TurnstileScript, os.Getenv("GROK_TURNSTILE_SCRIPT"), defaultTurnstileScript)
+	python := firstNonEmpty(in.TurnstilePython, os.Getenv("GROK_TURNSTILE_PYTHON"), turnstilePython())
+	script := firstNonEmpty(in.TurnstileScript, os.Getenv("GROK_TURNSTILE_SCRIPT"), turnstileScriptPath("turnstile_mint.py"))
+	if script == "" {
+		return "", fmt.Errorf("找不到 turnstile_mint.py，已查找: %s", strings.Join(turnstileScriptDirs(), ", "))
+	}
 	mode := firstNonEmpty(in.TurnstileMode, os.Getenv("TURNSTILE_MODE"), defaultTurnstileMode)
 	if strings.TrimSpace(sitekey) == "" {
 		sitekey = fallbackTurnstileSitekey
@@ -37,6 +81,7 @@ func mintTurnstileToken(ctx context.Context, in Input, sitekey, pageURL string) 
 	if strings.TrimSpace(pageURL) == "" {
 		pageURL = turnstileSignURL
 	}
+	in.logf("Turnstile 签发脚本: %s (python=%s mode=%s)", script, python, mode)
 
 	cctx, cancel := context.WithTimeout(ctx, 140*time.Second)
 	defer cancel()

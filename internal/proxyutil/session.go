@@ -4,14 +4,20 @@ import (
 	cryptorand "crypto/rand"
 	"encoding/hex"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 )
 
+// sessionParamRe matches the BestGo username session fragment. A fresh
+// session per registration prevents independent tasks from sharing one exit.
+var sessionParamRe = regexp.MustCompile(`(?i)(-session-)[^-]*`)
+
 // WithBestGoTaskSession gives a dynamic BestGo residential proxy a stable
 // task-level session. Without it, BestGo rotates the exit per request, which
 // makes one browser/protocol registration appear from multiple IP addresses.
-// An explicit user-provided session is preserved.
+// Explicit session fragments are replaced so each registration gets a stable,
+// task-local exit instead of sharing one fixed IP across all tasks.
 func WithBestGoTaskSession(raw string) string {
 	raw = strings.TrimSpace(raw)
 	lower := strings.ToLower(raw)
@@ -24,11 +30,13 @@ func WithBestGoTaskSession(raw string) string {
 		return raw
 	}
 	user := u.User.Username()
-	if strings.Contains(strings.ToLower(user), "-session-") {
-		return raw
+	token := sessionToken(8)
+	if sessionParamRe.MatchString(user) {
+		user = sessionParamRe.ReplaceAllString(user, "${1}"+token)
+	} else {
+		user += "-session-" + token
 	}
 	pass, hasPass := u.User.Password()
-	user += "-session-" + sessionToken(8)
 	if hasPass {
 		u.User = url.UserPassword(user, pass)
 	} else {

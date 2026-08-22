@@ -16,18 +16,24 @@
 ## 分层
 
 - `internal/grokreg`：浏览器注册、Turnstile、协议注册、清除验证和代理会话。
-- `internal/grokproducer`：单任务/批量任务、并发控制、停止、日志和截图落库。
+- `internal/grokoauth`：将 Grok Web SSO 通过 xAI 设备码流程转换成 Build OAuth，并生成 Sub2API/CPA 导出结构。
+- `internal/grokproducer`：单任务/批量任务、失败冷却补单、并发控制、停止、日志和截图落库。
 - `internal/livecheck`：Console DPoP 测活和 OAuth refresh 回退，区分 alive/dead/unknown。
 - `internal/mailfetch`、`internal/mailverify`：Outlook Graph/IMAP、Gmail/IMAP 取件和后台凭据验证。
 - `internal/handlers`：登录、邮箱、设置、代理和 Grok API。
 - `internal/db`、`internal/models`：SQLite 初始化、迁移、孤儿任务回收和邮箱关联。
+- `internal/proxyutil`：统一代理格式、HTTP transport 和 BestGo 任务级 session。
 - `frontend`：全新浅色 SaaS 控制台，不复用源项目静态资源。
 
 ## 数据与任务
 
 Grok 账号存储在 `grok_registrations`，邮箱存储在 `mailboxes`。启动时残留的 `registering`/`waiting_code` 账号会标为 `register_failed`。注册成功后会话数据仅通过导出接口返回，列表和日志接口不返回完整凭据。
 
-批量生产从已验证邮箱中领取未使用地址；每个任务使用独立上下文和代理配置。测活只在用户主动触发时运行，`unknown` 不会覆盖为 `dead` 的业务语义。
+批量生产从已验证邮箱中领取地址。首批只领取并发上限数量，后台补单循环在任务失败后继续领取，直到本次成功数达到目标或没有可用邮箱；临时失败受 `retry_cooldown_min` 约束，同一邮箱受 `mailbox_interval_min` 约束，`already_registered` 为不可重试终态。本项目没有 ChatGPT 账号表，因此不迁移参考项目从 ChatGPT 账号池优先取号的分支。
+
+注册成功后，生产器用同一任务代理将 SSO 转换成 xAI Build OAuth，写入 `auth_data.oauth`。预铸失败不改变注册结果；导出 Sub2API 或 CPA 时会对旧记录并发补铸并写回，只有成功导出的记录才标记 `shipped`。Console 与 Grok2API 继续直接使用 SSO。
+
+每个任务使用独立上下文和代理配置。BestGo 固定 session 会替换成随机任务 session，保证单任务出口稳定且任务之间不共用出口。测活只在用户主动触发时运行，`unknown` 不会覆盖为 `dead` 的业务语义。
 
 ## 前端边界
 
@@ -42,6 +48,16 @@ Grok 账号存储在 `grok_registrations`，邮箱存储在 `mailboxes`。启动
 Turnstile helper 保留为 `scripts/` 下的独立 Linux 部署资产，而不是在 Go 启动时动态下载或在 Windows 上静默回退。这样可以让管理台在 Windows 上正常开发和运维，同时避免把平台相关的浏览器二进制、Python 环境和敏感配置混入仓库。
 
 ## 变更历史
+
+### 2026-08-22 - 同步参考项目 Grok 增量能力
+
+**变更内容**：新增 SSO 到 xAI Build OAuth 的设备码转换，补齐 Console、Grok2API、Sub2API 和 CPA 四种导出；注册成功后预铸 OAuth，旧号导出时补铸；批量生产改为按并发领取、失败冷却和持续补单；邮箱已注册改为终态；统一代理 transport、BestGo 任务 session 与 Turnstile 脚本自动发现。
+
+**变更理由**：原项目只保留 SSO 两种导出，批量任务一次性领取全部邮箱且失败后不补单，也依赖固定的 helper 路径。参考项目已经解决 OAuth 消费端兼容、批量目标达成和部署脚本定位问题，需要按 Grok-only 数据边界迁入。
+
+**影响范围**：`internal/grokoauth`、`internal/grokproducer`、`internal/grokreg`、`internal/handlers`、`internal/proxyutil`、Grok/设置前端、嵌入式静态资源和部署说明。`/api/grok/download` 的 `sub2api` 语义改为 OAuth 账号包，旧 SSO 池格式使用 `grok2api`。
+
+**决策依据**：保留本项目 React 管理台和仅含 `mailboxes`/`grok_registrations` 的模型，不引入参考项目其他平台表；OAuth 预铸采用非阻断策略，确保凭据消费能力增强不会把成功注册降级为失败。
 
 ### 2026-08-08 - 发布前敏感信息与旧产品引用扫描
 
